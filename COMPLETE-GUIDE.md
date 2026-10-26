@@ -11,7 +11,7 @@ The sample asks for:
 5. Kubernetes: run two `nginx:alpine` replicas labelled `tier=cart`, expose NodePort `30093`, and verify pods and service port.
 6. IaC: Terraform creates `cart_endpoint.txt` with exactly `PORT=30093`; verify its contents with an Ansible ad-hoc command.
 
-The app is deliberately tiny. It is a lab demonstration, not a real shopping/payment platform. The Docker image built in task 4 and the Kubernetes `nginx:alpine` image in task 5 are separate because the exam explicitly requests different images.
+The app is deliberately tiny: a browser frontend plus a JSON backend that keeps cart items in memory. It is a lab demonstration, not a production shopping platform. Docker runs the custom Alpine frontend and Python backend. Kubernetes uses the required exact `nginx:alpine` image for its two frontend replicas, mounts the same frontend files from a ConfigMap, and sends API requests to a backend service.
 
 ## A. The flow and what connects
 
@@ -27,11 +27,12 @@ Git local repo ── push ──► GitHub cart-platform
                               │ Docker socket
                               ▼
                      Docker Desktop engine
-                  retail-cart:1.0 container :8083
+             retail-cart:1.0 :8083 → cart-backend:1.0 :5000
 
-Docker Desktop Kubernetes: nginx:alpine × 2 → NodePort service 30093
-                                              ↑ kubectl port-forward
-                                   Windows localhost:30093
+Docker Desktop Kubernetes: nginx:alpine × 2 → cart NodePort :30093
+             Nginx /api proxy → backend ClusterIP :5000
+                         ↑ kubectl port-forward
+              Windows localhost:30093
 
 Terraform container → cart_endpoint.txt → Ansible ad-hoc check
 ```
@@ -218,67 +219,78 @@ pipeline {
         stage('Run Linter') {
             steps {
                 sh 'python3 -m json.tool inventory.json > /dev/null'
-                echo 'inventory.json is valid JSON'
+                sh 'python3 -m unittest discover -s backend/tests -p "test_*.py"'
             }
         }
 
         stage('Docker Package') {
             steps {
-                sh 'docker build -t retail-cart:1.0 .'
+                sh 'docker build -t retail-cart:1.0 ./frontend'
+                sh 'docker build -t cart-backend:1.0 ./backend'
             }
         }
     }
 }
 ```
 
-The linter stage uses Python's JSON parser to reject malformed inventory JSON. The package stage builds the Alpine-based web image. If checkout fails, check the public URL/credential. If Docker reports it cannot connect to the daemon, verify `docker exec jenkins docker version`; do not expose a TCP daemon.
+The linter stage parses the inventory JSON and runs the backend unit tests. The package stage builds both the Alpine frontend and Python backend images. If checkout fails, check the public URL/credential. If Docker reports it cannot connect to the daemon, verify `docker exec jenkins docker version`; do not expose a TCP daemon.
 
-### 4. Docker: build/run the requested Alpine image
+### 4. Docker: build and launch the frontend and backend
 
-The Jenkins job builds this image; if you need to demonstrate the Docker task directly in PowerShell, run:
+From the project root, build both images and start the microservice detached:
 
 ```powershell
-docker build -t retail-cart:1.0 .
-docker run -d --name retail-cart -p 8083:80 retail-cart:1.0
+docker compose up --build -d
 docker ps
 ```
 
-Open **http://localhost:8083**. It should display **Shopping Cart Active**. You can also check the response from PowerShell:
+Compose creates image `retail-cart:1.0` from `frontend\Dockerfile` (based on Alpine) and `cart-backend:1.0` from `backend\Dockerfile`. It publishes the frontend on `8083:80`; the frontend reaches the backend over the Compose network on port 5000. `docker ps` should show both containers running and the frontend port mapping.
+
+Open **http://localhost:8083**. The page should show **Shopping Cart Active** and a cart form. Add an item to verify the UI calls the backend API through Nginx. You can inspect the API response via the frontend proxy:
 
 ```powershell
-(Invoke-WebRequest -Uri http://localhost:8083).Content
+Invoke-RestMethod http://localhost:8083/api/cart
 ```
 
-The container logs the required text and runs BusyBox HTTP server in the Alpine image so it remains running in detached mode and serves the same text. Check both the browser response and:
+The frontend container logs the required message when it starts:
 
 ```powershell
 docker logs retail-cart
 ```
 
-`docker ps` should show port mapping `0.0.0.0:8083->80/tcp` (or equivalent).
-
-If a prior run already created the named container, remove only that specific lab container before rerunning:
+`docker ps` should show `0.0.0.0:8083->80/tcp` (or equivalent). To stop both app containers:
 
 ```powershell
-docker rm -f retail-cart
+docker compose down
 ```
 
-### 5. Kubernetes: two replicas, NodePort, and localhost port-forward
+### 5. Kubernetes: frontend and backend, two frontend replicas, localhost port-forward
 
-Use Docker Desktop Kubernetes, select its context, then apply the Deployment and NodePort Service:
+The Kubernetes configuration provides a backend API with an internal `ClusterIP` service and exactly two frontend replicas using the required `nginx:alpine` image, label `tier=cart`, and NodePort `30093`. The frontend uses the same HTML and Nginx proxy configuration as the Docker deployment.
+
+Select Docker Desktop Kubernetes and create/update a ConfigMap from the frontend source files:
 
 ```powershell
 kubectl config use-context docker-desktop
 kubectl get nodes
-kubectl apply -f .\kubernetes\cart.yaml
-kubectl rollout status deployment/cart
-kubectl get pods -l tier=cart -o wide
-kubectl get service cart
+kubectl create configmap cart-frontend-files --from-file=default.conf=.\frontend\nginx.conf --from-file=index.html=.\frontend\index.html --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-Expected: two Ready pods labelled `tier=cart`, and service `cart` reports `80:30093/TCP`.
+The backend image should already exist from the Docker task. Apply the manifests and check both tiers:
 
-In a dedicated PowerShell window, start a port-forward and leave it running:
+```powershell
+kubectl apply -f .\kubernetes\cart.yaml
+kubectl rollout status deployment/backend
+kubectl rollout status deployment/cart
+kubectl get pods -l tier=cart -o wide
+kubectl get pods -l app=cart-backend -o wide
+kubectl get service cart
+kubectl get service backend
+```
+
+Expected: two Ready frontend pods labelled `tier=cart`, a Ready backend pod, frontend service `cart` reporting `80:30093/TCP`, and backend service `backend` reporting `5000/TCP`.
+
+In a dedicated PowerShell window, port-forward the frontend service and leave the command running:
 
 ```powershell
 kubectl port-forward service/cart 30093:80
@@ -290,16 +302,18 @@ In a second PowerShell window, verify access:
 (Invoke-WebRequest -Uri http://localhost:30093 -TimeoutSec 10).StatusCode
 ```
 
-Expected HTTP status is `200`. You may also open **http://localhost:30093** in the browser; the stock `nginx:alpine` welcome page is expected. The Service remains a NodePort on `30093`; `kubectl port-forward` provides reliable Windows localhost access without changing the cluster or Service. Keep the first PowerShell window open while testing; press **Ctrl+C** there to stop forwarding.
+Expected HTTP status is `200`. Open **http://localhost:30093** and add an item: the page should load and show the updated cart. Nginx in a frontend pod proxies `/api/` requests to the backend service at `backend:5000`. The Service remains a NodePort on `30093`; `kubectl port-forward` provides reliable localhost access without changing the cluster. Keep the first PowerShell window open while testing; press **Ctrl+C** there to stop the forward.
 
-This Kubernetes task checks the requested Nginx replicas/service, while the separate Docker task displays **Shopping Cart Active**.
+This deploys both sides of the microservice while preserving the exam's exact frontend image, replica count, label, NodePort, and pod/service verification.
 
 If the pods are not Ready, inspect only the relevant resources:
 
 ```powershell
 kubectl describe pods -l tier=cart
 kubectl logs deployment/cart
+kubectl logs deployment/backend
 kubectl get endpoints cart
+kubectl get endpoints backend
 ```
 
 If `localhost:30093` does not respond, confirm the port-forward command is still running and the Service has a ready endpoint:
@@ -351,17 +365,18 @@ The photographed paper allows **1 hour 15 minutes**. Complete tool installation,
 | 10–17 min | Jira tickets and sprint report | CART-10/CART-11 Done; sprint completed/report shown |
 | 17–30 min | Jenkins | Three pipeline stages green; console output |
 | 30–38 min | Docker | `docker ps`; browser on `localhost:8083` |
-| 38–53 min | Kubernetes | Two Ready pods, `80:30093/TCP`, browser on `localhost:30093` |
+| 38–53 min | Kubernetes | Two frontend replicas, backend pod, `80:30093/TCP`, cart UI on `localhost:30093` |
 | 53–68 min | Terraform and Ansible | `cart_endpoint.txt` exact value and ad-hoc `SUCCESS` |
 | 68–75 min | Final review | Re-show requested outputs |
 
 ## E. Cleanup after practice (optional)
 
-Stop the app container and remove only the lab Kubernetes resources:
+Stop the Docker Compose app and remove only the lab Kubernetes resources:
 
 ```powershell
-docker rm -f retail-cart
+docker compose down
 kubectl delete -f .\kubernetes\cart.yaml
+kubectl delete configmap cart-frontend-files
 ```
 
 Stop Jenkins while preserving its saved configuration:

@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      tier: cart
+  template:
+    metadata:
+      labels:
+        tier: cart
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cart
+spec:
+  type: NodePort
+  selector:
+    tier: cart
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30093

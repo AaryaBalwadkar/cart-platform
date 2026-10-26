@@ -1,0 +1,7 @@
+services:
+  tools:
+    build:
+      context: .
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace
